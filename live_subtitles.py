@@ -6,10 +6,11 @@ import queue
 import sys
 import time
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QLocale, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -30,19 +31,101 @@ logging.set_verbosity_error()
 # 麦克风设备号：环境变量 LIVE_SUBTITLES_MIC 可覆盖，缺省用系统默认输入设备
 MIC_DEVICE_ENV = "LIVE_SUBTITLES_MIC"
 
+# 字号（px）：译文历史最新行 = FONT_BASE_PX + font_scale
+# 下限照顾 1920x1080 全屏，上限给 4K 全屏放大
+FONT_BASE_PX = 17
+FONT_PX_MIN = 9
+FONT_PX_MAX = 48
 
-def _asr_text(res) -> str:
+# 语言表：(英语名/键, 中文名, Qwen3-ASR 支持, Hy-MT2 支持, 系统 locale 语言码)
+# 源语言下拉只给 ASR 支持的，译文语言下拉只给 Hy-MT2 支持的
+LANG_ROWS = [
+    ("Chinese", "中文", True, True, ("zh",)),
+    ("Traditional Chinese", "繁体中文", False, True, ()),
+    ("English", "英语", True, True, ("en",)),
+    ("Cantonese", "粤语", True, True, ()),
+    ("Japanese", "日语", True, True, ("ja",)),
+    ("Korean", "韩语", True, True, ("ko",)),
+    ("French", "法语", True, True, ("fr",)),
+    ("German", "德语", True, True, ("de",)),
+    ("Spanish", "西班牙语", True, True, ("es",)),
+    ("Portuguese", "葡萄牙语", True, True, ("pt",)),
+    ("Italian", "意大利语", True, True, ("it",)),
+    ("Russian", "俄语", True, True, ("ru",)),
+    ("Arabic", "阿拉伯语", True, True, ("ar",)),
+    ("Thai", "泰语", True, True, ("th",)),
+    ("Vietnamese", "越南语", True, True, ("vi",)),
+    ("Malay", "马来语", True, True, ("ms",)),
+    ("Indonesian", "印尼语", True, True, ("id",)),
+    ("Filipino", "菲律宾语", True, True, ("tl", "fil")),
+    ("Hindi", "印地语", True, True, ("hi",)),
+    ("Turkish", "土耳其语", True, True, ("tr",)),
+    ("Dutch", "荷兰语", True, True, ("nl",)),
+    ("Polish", "波兰语", True, True, ("pl",)),
+    ("Czech", "捷克语", True, True, ("cs",)),
+    ("Persian", "波斯语", True, True, ("fa",)),
+    ("Ukrainian", "乌克兰语", False, True, ("uk",)),
+    ("Swedish", "瑞典语", True, False, ()),
+    ("Danish", "丹麦语", True, False, ()),
+    ("Finnish", "芬兰语", True, False, ()),
+    ("Greek", "希腊语", True, False, ()),
+    ("Romanian", "罗马尼亚语", True, False, ()),
+    ("Hungarian", "匈牙利语", True, False, ()),
+    ("Macedonian", "马其顿语", True, False, ()),
+    ("Khmer", "高棉语", False, True, ("km",)),
+    ("Burmese", "缅甸语", False, True, ("my",)),
+    ("Gujarati", "古吉拉特语", False, True, ("gu",)),
+    ("Urdu", "乌尔都语", False, True, ("ur",)),
+    ("Telugu", "泰卢固语", False, True, ("te",)),
+    ("Marathi", "马拉地语", False, True, ("mr",)),
+    ("Hebrew", "希伯来语", False, True, ("he",)),
+    ("Bengali", "孟加拉语", False, True, ("bn",)),
+    ("Tamil", "泰米尔语", False, True, ("ta",)),
+    ("Tibetan", "藏语", False, True, ()),
+    ("Kazakh", "哈萨克语", False, True, ("kk",)),
+    ("Mongolian", "蒙古语", False, True, ("mn",)),
+    ("Uyghur", "维吾尔语", False, True, ("ug",)),
+]
+MT_ZH_BY_KEY = {r[0]: r[1] for r in LANG_ROWS if r[3]}
+LOCALE_TO_KEY = {lc: r[0] for r in LANG_ROWS for lc in r[4]}
+
+
+def _system_lang_key() -> str:
+    """译文语言选 auto 时，解析系统语言为语言键；不支持则回退英语。"""
+    try:
+        name = QLocale.system().name() or ""  # 例如 zh_CN
+    except Exception:
+        name = ""
+    if not name:
+        name = os.environ.get("LANG", "")
+    name = name.split(".")[0].replace("-", "_")
+    lang, _, terr = name.partition("_")
+    lang = lang.lower()
+    if lang == "zh":
+        if terr.upper() in ("TW", "HK", "MO"):
+            return "Traditional Chinese"
+        return "Chinese"
+    return LOCALE_TO_KEY.get(lang, "English")
+
+
+def _asr_parts(res) -> tuple:
+    """返回 (语言, 文本)；语言为 ASR 检测到的英语名，识别失败为空。"""
     if isinstance(res, list):
         if not res:
-            return ""
-        return (getattr(res[0], "text", "") or "").strip()
-    return (getattr(res, "text", "") or "").strip()
+            return "", ""
+        res = res[0]
+    lang = (getattr(res, "language", "") or "").strip()
+    text = (getattr(res, "text", "") or "").strip()
+    return lang, text
 
 
-def _translate(mt_tokenizer, mt_model, text, device="cuda:0") -> str:
+def _translate(mt_tokenizer, mt_model, text, target_zh, device="cuda:0") -> str:
     if not text.strip() or len(text.strip()) < 2:
         return ""
-    prompt = f"将以下内容翻译成中文（如果是中文则翻译成英文）：\n{text}"
+    prompt = (
+        f"将以下文本翻译为{target_zh}，"
+        f"注意只需要输出翻译后的结果，不要额外解释：\n{text}"
+    )
     messages = [{"role": "user", "content": prompt}]
     input_text = mt_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -84,12 +167,17 @@ class SubtitleWorker(QThread):
     def __init__(self):
         super().__init__()
         self.is_running = True
+        # 源语言：ASR 英语名（如 "Chinese"），None = auto 模型自己识别
+        self.src_lang = None
+        # 译文语言键（如 "Chinese"），None = auto 取系统语言
+        self.tgt_lang = None
 
     def run(self):
         asr_model = None
         mt_model = None
         mt_tokenizer = None
         try:
+            sys_lang_key = _system_lang_key()
             print(">>> 5090 正在载入模型...", flush=True)
             self.sig_status.emit("正在载入 ASR 模型...")
             asr_model = Qwen3ASRModel.from_pretrained(
@@ -146,6 +234,7 @@ class SubtitleWorker(QThread):
             buffer = []
             silence_chunks = 0
             last_asr_time = time.time()
+            cached_lang = ""
             cached_txt = ""
             cache_valid = False
 
@@ -173,9 +262,13 @@ class SubtitleWorker(QThread):
                         ):
                             try:
                                 audio_data = np.concatenate(buffer).flatten()
-                                res = asr_model.transcribe((audio_data, SAMPLE_RATE))
-                                txt = _asr_text(res)
+                                res = asr_model.transcribe(
+                                    (audio_data, SAMPLE_RATE),
+                                    language=self.src_lang,
+                                )
+                                lang, txt = _asr_parts(res)
                                 if txt:
+                                    cached_lang = lang
                                     cached_txt = txt
                                     cache_valid = True
                                     self.sig_interim.emit(txt)
@@ -197,25 +290,32 @@ class SubtitleWorker(QThread):
                         buffer = []
                         silence_chunks = 0
                         if cache_valid and cached_txt:
+                            final_lang = cached_lang
                             final_src = cached_txt
                         else:
                             try:
                                 res = asr_model.transcribe(
-                                    (audio_data, SAMPLE_RATE)
+                                    (audio_data, SAMPLE_RATE),
+                                    language=self.src_lang,
                                 )
-                                final_src = _asr_text(res)
+                                final_lang, final_src = _asr_parts(res)
                             except Exception as e:
                                 print(f">>> 最终识别失败: {e}", flush=True)
-                                final_src = ""
+                                final_lang, final_src = "", ""
                         cache_valid = False
                         if self.is_running and final_src and len(final_src) > 1:
-                            try:
-                                final_dst = _translate(
-                                    mt_tokenizer, mt_model, final_src
-                                )
-                            except Exception as e:
-                                print(f">>> 翻译失败: {e}", flush=True)
-                                final_dst = ""
+                            tgt_key = self.tgt_lang or sys_lang_key
+                            tgt_zh = MT_ZH_BY_KEY.get(tgt_key, "中文")
+                            if final_lang and final_lang == tgt_key:
+                                final_dst = final_src
+                            else:
+                                try:
+                                    final_dst = _translate(
+                                        mt_tokenizer, mt_model, final_src, tgt_zh
+                                    )
+                                except Exception as e:
+                                    print(f">>> 翻译失败: {e}", flush=True)
+                                    final_dst = ""
                             self.sig_final.emit(final_src, final_dst)
         except Exception as e:
             import traceback
@@ -257,9 +357,8 @@ class SubtitleWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # 窗口尺寸策略：允许自由缩放
-        self.setMinimumSize(280, 100)
-        self.resize(1000, 260)
+        # 窗口尺寸策略：允许自由缩放；默认尺寸在 _place_on_screen 里按屏幕算
+        self.setMinimumSize(400, 110)
 
         self.font_scale = 0
         self.history_out = deque(maxlen=5)
@@ -275,10 +374,47 @@ class SubtitleWindow(QWidget):
         top_bar = QHBoxLayout(self.top_bar_widget)
         top_bar.setContentsMargins(4, 0, 4, 0)
 
-        self.title_label = QLabel("  5090 实时同传 (按住任意处可拖拽挪动)")
+        self.title_label = QLabel("  5090 实时同传")
         self.title_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         self.title_label.setStyleSheet("color: rgba(255, 255, 255, 140);")
+        self.title_label.setToolTip("按住任意处可拖拽挪动；右下角手柄缩放窗口")
         top_bar.addWidget(self.title_label)
+
+        lang_label_style = "color: rgba(255, 255, 255, 140); font-size: 11px;"
+
+        lbl_src = QLabel("识别:")
+        lbl_src.setStyleSheet(lang_label_style)
+        top_bar.addWidget(lbl_src)
+
+        self.combo_src = QComboBox()
+        self.combo_src.addItem("auto 自动识别", None)
+        for key, zh, asr_ok, _mt_ok, _locales in LANG_ROWS:
+            if asr_ok:
+                self.combo_src.addItem(zh, key)
+        self.combo_src.setFixedHeight(22)
+        self.combo_src.setMinimumWidth(88)
+        self.combo_src.setStyleSheet(self._combo_style())
+        self.combo_src.setToolTip("源语言（识别语种）：auto = 模型自己识别")
+        top_bar.addWidget(self.combo_src)
+
+        lbl_tgt = QLabel("译文:")
+        lbl_tgt.setStyleSheet(lang_label_style)
+        top_bar.addWidget(lbl_tgt)
+
+        self.combo_tgt = QComboBox()
+        self.combo_tgt.addItem("auto 系统语言", None)
+        for key, zh, _asr_ok, mt_ok, _locales in LANG_ROWS:
+            if mt_ok:
+                self.combo_tgt.addItem(zh, key)
+        self.combo_tgt.setFixedHeight(22)
+        self.combo_tgt.setMinimumWidth(96)
+        self.combo_tgt.setStyleSheet(self._combo_style())
+        self.combo_tgt.setToolTip(
+            "译文语言：auto = 系统语言（当前解析为 "
+            f"{MT_ZH_BY_KEY.get(_system_lang_key(), '英语')}）"
+        )
+        top_bar.addWidget(self.combo_tgt)
+
         top_bar.addStretch()
 
         btn_font_minus = QPushButton("A-")
@@ -294,6 +430,22 @@ class SubtitleWindow(QWidget):
         btn_font_plus.setToolTip("放大字体")
         btn_font_plus.clicked.connect(lambda: self.change_font_size(1))
         top_bar.addWidget(btn_font_plus)
+
+        # 字号直选：与 A-/A+ 双向同步
+        self.combo_font = QComboBox()
+        for px in range(FONT_PX_MIN, FONT_PX_MAX + 1):
+            self.combo_font.addItem(f"{px}px", px)
+        self.combo_font.setFixedHeight(22)
+        self.combo_font.setMinimumWidth(58)
+        self.combo_font.setStyleSheet(self._combo_style())
+        self.combo_font.setToolTip(
+            f"字号选择（{FONT_PX_MIN}~{FONT_PX_MAX}px）："
+            "1080p 建议 9~16，4K 全屏可放大到 32+"
+        )
+        init_font_idx = self.combo_font.findData(FONT_BASE_PX)
+        if init_font_idx >= 0:
+            self.combo_font.setCurrentIndex(init_font_idx)
+        top_bar.addWidget(self.combo_font)
 
         btn_clear = QPushButton("清空")
         btn_clear.setFixedSize(40, 22)
@@ -343,7 +495,6 @@ class SubtitleWindow(QWidget):
         bottom_bar.setContentsMargins(4, 0, 0, 0)
 
         self.live_label = QLabel("Waiting for speech...")
-        self.live_label.setFont(QFont("Arial", 11, QFont.Weight.Medium))
         self.live_label.setStyleSheet("""
             color: #A0C4FF;
             background-color: rgba(20, 20, 20, 200);
@@ -374,6 +525,7 @@ class SubtitleWindow(QWidget):
         self.setLayout(main_layout)
 
         self._place_on_screen()
+        self._apply_font()
         self.render_history(">>> 正在启动引擎，加载模型中，请稍候...")
 
         QShortcut(QKeySequence("Esc"), self, self.close)
@@ -383,18 +535,26 @@ class SubtitleWindow(QWidget):
         self.worker.sig_error.connect(self.show_error)
         self.worker.sig_interim.connect(self.update_interim)
         self.worker.sig_final.connect(self.update_final)
+        self.combo_src.currentIndexChanged.connect(self._on_src_lang_changed)
+        self.combo_tgt.currentIndexChanged.connect(self._on_tgt_lang_changed)
+        self.combo_font.currentIndexChanged.connect(self._on_font_changed)
         self.worker.start()
 
     def _place_on_screen(self):
         screen = QApplication.primaryScreen()
         if screen is None:
+            self.resize(800, 220)
             self.move(400, 720)
             return
         area = screen.availableGeometry()
-        x = area.x() + max(0, (area.width() - self.width()) // 2)
+        # 默认尺寸按屏幕比例：1080p 收敛些，4K 不至于太迷你
+        w = max(480, min(1400, int(area.width() * 0.52)))
+        h = max(160, min(420, int(area.height() * 0.24)))
+        self.resize(w, h)
+        x = area.x() + max(0, (area.width() - w) // 2)
         y = area.y() + int(area.height() * 0.65)
-        x = max(area.x(), min(x, area.x() + area.width() - self.width()))
-        y = max(area.y(), min(y, area.y() + area.height() - self.height()))
+        x = max(area.x(), min(x, area.x() + area.width() - w))
+        y = max(area.y(), min(y, area.y() + area.height() - h))
         self.move(x, y)
 
     def _btn_style(self, bg_color):
@@ -413,9 +573,77 @@ class SubtitleWindow(QWidget):
             }}
         """
 
-    def change_font_size(self, delta):
-        self.font_scale = max(-4, min(10, self.font_scale + delta))
+    def _combo_style(self):
+        return """
+            QComboBox {
+                background: rgba(40, 40, 40, 200);
+                color: #DDD;
+                border: 1px solid rgba(255, 255, 255, 40);
+                border-radius: 4px;
+                padding: 1px 6px;
+                font-size: 11px;
+            }
+            QComboBox:hover, QComboBox:focus {
+                border-color: rgba(255, 255, 255, 120);
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 16px;
+            }
+            QComboBox QAbstractItemView {
+                background: #2a2a2a;
+                color: #EEE;
+                border: 1px solid #555;
+                selection-background-color: #555;
+                selection-color: white;
+            }
+        """
+
+    def _on_src_lang_changed(self, index):
+        key = self.combo_src.itemData(index)
+        self.worker.src_lang = key
+        label = key or "auto（模型自动识别）"
+        print(f">>> 识别语言已切换: {label}", flush=True)
+
+    def _on_tgt_lang_changed(self, index):
+        key = self.combo_tgt.itemData(index)
+        self.worker.tgt_lang = key
+        if key:
+            label = key
+        else:
+            sys_key = _system_lang_key()
+            label = f"auto（系统语言 → {MT_ZH_BY_KEY.get(sys_key, sys_key)}）"
+        print(f">>> 译文语言已切换: {label}", flush=True)
+
+    def _font_px(self) -> int:
+        return FONT_BASE_PX + self.font_scale
+
+    def _set_font_px(self, px: int):
+        px = max(FONT_PX_MIN, min(FONT_PX_MAX, px))
+        self.font_scale = px - FONT_BASE_PX
+        idx = self.combo_font.findData(px)
+        if idx >= 0 and self.combo_font.currentIndex() != idx:
+            self.combo_font.blockSignals(True)
+            self.combo_font.setCurrentIndex(idx)
+            self.combo_font.blockSignals(False)
+        self._apply_font()
+
+    def _on_font_changed(self, index):
+        px = self.combo_font.itemData(index)
+        if px is not None:
+            self.font_scale = int(px) - FONT_BASE_PX
+            self._apply_font()
+
+    def _apply_font(self):
         self.render_history()
+        # 底部实时原文跟着缩放，略小一号
+        if hasattr(self, "live_label"):
+            f = self.live_label.font()
+            f.setPixelSize(max(FONT_PX_MIN, self._font_px() - 4))
+            self.live_label.setFont(f)
+
+    def change_font_size(self, delta):
+        self._set_font_px(self._font_px() + delta)
 
     def clear_history(self):
         self.history_out.clear()
@@ -435,8 +663,8 @@ class SubtitleWindow(QWidget):
 
         html_snippets = []
         total = len(self.history_out)
-        base_size = 17 + self.font_scale
-        hist_size = max(11, base_size - 4)
+        base_size = max(FONT_PX_MIN, FONT_BASE_PX + self.font_scale)
+        hist_size = max(FONT_PX_MIN, base_size - 4)
 
         for idx, text in enumerate(self.history_out):
             safe_text = html.escape(text)
@@ -471,8 +699,22 @@ class SubtitleWindow(QWidget):
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.top_bar_widget.hide()
+        # 语言下拉展开时鼠标会移出主窗口，此时不能收起顶栏，否则选项点不到
+        if not self._lang_combo_popup_open():
+            self.top_bar_widget.hide()
         super().leaveEvent(event)
+
+    def _lang_combo_popup_open(self) -> bool:
+        for combo in (self.combo_src, self.combo_tgt, self.combo_font):
+            if combo.view().window().isVisible():
+                return True
+        return False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 窄窗口先藏标题，把空间让给语言/字号控件
+        if hasattr(self, "title_label"):
+            self.title_label.setVisible(self.width() >= 640)
 
     # 鼠标左键点击任意非按钮区域 -> 自由挪动位置
     def mousePressEvent(self, event):
