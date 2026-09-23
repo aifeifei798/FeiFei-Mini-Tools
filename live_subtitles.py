@@ -258,7 +258,7 @@ class SubtitleWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         # 窗口尺寸策略：允许自由缩放
-        self.setMinimumSize(500, 180)
+        self.setMinimumSize(280, 100)
         self.resize(1000, 260)
 
         self.font_scale = 0
@@ -270,8 +270,9 @@ class SubtitleWindow(QWidget):
         main_layout.setContentsMargins(10, 8, 10, 8)
         main_layout.setSpacing(6)
 
-        # ---------------- 顶部控制条 (拖拽条 + 按钮) ----------------
-        top_bar = QHBoxLayout()
+        # ---------------- 顶部控制条 (拖拽条 + 按钮，默认隐藏，悬停显示) ----------------
+        self.top_bar_widget = QWidget()
+        top_bar = QHBoxLayout(self.top_bar_widget)
         top_bar.setContentsMargins(4, 0, 4, 0)
 
         self.title_label = QLabel("  5090 实时同传 (按住任意处可拖拽挪动)")
@@ -320,7 +321,8 @@ class SubtitleWindow(QWidget):
         btn_close.clicked.connect(self.close)
         top_bar.addWidget(btn_close)
 
-        main_layout.addLayout(top_bar)
+        main_layout.addWidget(self.top_bar_widget)
+        self.top_bar_widget.hide()
 
         # ---------------- 译文 5 行历史大框 ----------------
         self.out_box = QLabel()
@@ -462,6 +464,15 @@ class SubtitleWindow(QWidget):
     def update_final(self, src_text, trans_text):
         self.live_label.setText(f"🗣️  {src_text}")
         self.render_history(trans_text or src_text)
+
+    # 鼠标移入窗口 -> 显示顶部控制条；移出 -> 隐藏
+    def enterEvent(self, event):
+        self.top_bar_widget.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.top_bar_widget.hide()
+        super().leaveEvent(event)
 
     # 鼠标左键点击任意非按钮区域 -> 自由挪动位置
     def mousePressEvent(self, event):
