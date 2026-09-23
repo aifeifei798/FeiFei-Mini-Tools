@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地环境/IDE
+.idea/
+.vscode/
+*.local
+
+# 模型与运行产物
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+outputs/
+logs/
+*.log

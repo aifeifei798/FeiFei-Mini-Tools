@@ -1,0 +1,9 @@
+# FeiFei-Mini-Tools 运行环境（live_subtitles 实测可用版本）
+PyQt6>=6.11
+numpy>=2.5
+sounddevice>=0.5.6
+torch>=2.14
+transformers>=4.57
+qwen-asr>=0.0.6
+accelerate>=1.12
+huggingface-hub>=0.36
